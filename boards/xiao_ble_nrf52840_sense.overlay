@@ -1,0 +1,36 @@
+/*
+ * Overlay XIAO BLE Sense — lettura batteria LiPo.
+ *
+ * Sul XIAO nRF52840 la tensione di batteria è su un partitore: il canale ADC è
+ * AIN7 (P0.31) e l'enable del partitore è P0.14 (attivo basso). Verifica i pin
+ * e il rapporto del partitore sulla TUA revisione board (vedi README/bring-up).
+ *
+ * L'IMU LSM6DS3TR-C è già dichiarata dalla board variant `/sense`: qui non serve
+ * ridefinirla. Se la tua DTS non espone l'alias 'imu', il firmware usa comunque
+ * il primo nodo st,lsm6dsl/lsm6dso okay (vedi src/main.c).
+ */
+#include <zephyr/dt-bindings/adc/adc.h>
+#include <zephyr/dt-bindings/adc/nrf-saadc.h>
+#include <zephyr/dt-bindings/gpio/gpio.h>
+
+/ {
+	zephyr,user {
+		io-channels = <&adc 7>;
+		vbat-enable-gpios = <&gpio0 14 GPIO_ACTIVE_LOW>;
+	};
+};
+
+&adc {
+	status = "okay";
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	channel@7 {
+		reg = <7>;
+		zephyr,gain = "ADC_GAIN_1_6";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 10)>;
+		zephyr,input-positive = <NRF_SAADC_AIN7>;
+		zephyr,resolution = <12>;
+	};
+};

@@ -1,0 +1,10 @@
+# Zephyr / nRF Connect SDK build artifacts
+build/
+build-*/
+twister-out/
+*.pyc
+__pycache__/
+.venv/
+
+# west workspace metadata (se si fa `west init -l` dentro la repo)
+.west/

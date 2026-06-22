@@ -1,0 +1,20 @@
+# AeroDrag Wheel — manifest west (app standalone su nRF Connect SDK).
+#
+# Uso (workspace-app, topologia T2):
+#   west init -l .            # inizializza il workspace usando questo manifest
+#   west update               # scarica NCS/Zephyr alla revisione sotto
+#   west build -b xiao_ble/nrf52840/sense
+#
+# La revisione NCS è pinnata per riproducibilità: adeguala a quella che hai
+# installato localmente se necessario (vedi README → bring-up).
+manifest:
+  remotes:
+    - name: nrfconnect
+      url-base: https://github.com/nrfconnect
+  projects:
+    - name: sdk-nrf
+      remote: nrfconnect
+      revision: v2.7.0
+      import: true
+  self:
+    path: aerodrag-wheel
