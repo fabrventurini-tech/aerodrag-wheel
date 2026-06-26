@@ -11,7 +11,7 @@ che sta sopra tutti i repo). Lavori SOLO in questo repo.
 
 RITUALE DI AVVIO (obbligatorio, ogni sessione):
 1. Leggi il contratto DA GIT, mai da cache/copie:
-   aerodrag-firmware/docs/CONTRACT.md @ main  -> versione RATIFICATA attuale: v0.3.1.
+   aerodrag-firmware/docs/CONTRACT.md @ main  -> usa la versione RATIFICATA indicata nell'header `contract:` del file (ad oggi v0.3.2).
 2. È in lavorazione il bump v0.4.0: NON è autorevole finché MOTHER non lo ratifica
    su main. Fino ad allora implementa/ragiona sulla v0.3.1 ratificata; se stai
    lavorando a una seam aperta del v0.4.0, trattala come PROPOSTA, non come verità.
