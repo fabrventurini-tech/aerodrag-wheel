@@ -33,6 +33,7 @@ LOG_MODULE_REGISTER(wheel_ble, LOG_LEVEL_INF);
 #define BT_UUID_WHEEL_CONFIG  BT_UUID_DECLARE_16(0xBB04)
 
 static volatile bool s_stream_subscribed;
+static int s_conn_count;          /* connessioni attive (gestione adv su bond_deleted) */
 
 /* ── Handler GATT ──────────────────────────────────────────────────────────── */
 
@@ -94,20 +95,25 @@ static void stream_ccc_cfg(const struct bt_gatt_attr *attr, uint16_t value)
 BT_GATT_SERVICE_DEFINE(wheel_svc,
 	BT_GATT_PRIMARY_SERVICE(BT_UUID_WHEEL_SVC),
 
+	/* (v0.3.4 §2.G) Sicurezza confine G: sottoscrizioni/scritture sensibili gated
+	 * dietro cifratura (LE SM1 L≥2). GUARDRAIL: Just Works/NoInputNoOutput su
+	 * entrambi i lati → Level 2 *unauthenticated* → si usa _ENCRYPT, NON _AUTHEN
+	 * (con Just Works _AUTHEN non sarebbe mai soddisfatto → write rifiutate per
+	 * sempre). Il wire/payload resta invariato. */
 	BT_GATT_CHARACTERISTIC(BT_UUID_WHEEL_STREAM, BT_GATT_CHRC_NOTIFY,
 			       BT_GATT_PERM_NONE, NULL, NULL, NULL),
-	BT_GATT_CCC(stream_ccc_cfg, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+	BT_GATT_CCC(stream_ccc_cfg, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE_ENCRYPT),
 
 	BT_GATT_CHARACTERISTIC(BT_UUID_WHEEL_RESULT, BT_GATT_CHRC_NOTIFY,
 			       BT_GATT_PERM_NONE, NULL, NULL, NULL),
-	BT_GATT_CCC(NULL, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+	BT_GATT_CCC(NULL, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE_ENCRYPT),
 
 	BT_GATT_CHARACTERISTIC(BT_UUID_WHEEL_CMD, BT_GATT_CHRC_WRITE,
-			       BT_GATT_PERM_WRITE, NULL, cmd_write, NULL),
+			       BT_GATT_PERM_WRITE_ENCRYPT, NULL, cmd_write, NULL),
 
 	BT_GATT_CHARACTERISTIC(BT_UUID_WHEEL_CONFIG,
 			       BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE,
-			       BT_GATT_PERM_READ | BT_GATT_PERM_WRITE,
+			       BT_GATT_PERM_READ | BT_GATT_PERM_WRITE_ENCRYPT,
 			       cfg_read, cfg_write, NULL),
 );
 
@@ -128,7 +134,7 @@ void wheel_ble_stream_notify(float speed_ms, float accel_ms2,
 	(void)bt_gatt_notify(NULL, ATTR_STREAM_VAL, frame, sizeof(frame));
 }
 
-/* ── Advertising + connessione ─────────────────────────────────────────────── */
+/* ── Advertising + connessione + bonding (v0.3.4 §2.G) ─────────────────────── */
 
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR),
@@ -138,38 +144,133 @@ static const struct bt_data sd[] = {
 	BT_DATA(BT_DATA_NAME_COMPLETE, DEVNAME, sizeof(DEVNAME) - 1),
 };
 
+/* Ripopola l'accept-list dai bond persistiti (callback di bt_foreach_bond). */
+static void al_add_bond(const struct bt_bond_info *info, void *user_data)
+{
+	int *n = user_data;
+	char s[BT_ADDR_LE_STR_LEN];
+
+	if (bt_le_filter_accept_list_add(&info->addr) == 0) {
+		bt_addr_le_to_str(&info->addr, s, sizeof(s));
+		LOG_INF("accept-list += %s", s);
+		(*n)++;
+	}
+}
+
+/* Ricostruisce l'accept-list dai bond. Ritorna true se ne esiste ≥1. */
+static bool rebuild_accept_list(void)
+{
+	int n = 0;
+
+	bt_le_filter_accept_list_clear();
+	bt_foreach_bond(BT_ID_DEFAULT, al_add_bond, &n);
+	return n > 0;
+}
+
 static void advertising_start(void)
 {
-	int err = bt_le_adv_start(BT_LE_ADV_CONN, ad, ARRAY_SIZE(ad),
-				  sd, ARRAY_SIZE(sd));
+	/* GUARDRAIL #1 (il più pericoloso): filtrare con l'accept-list SOLO se esiste
+	 * già un bond. Pubblicizzare con FILTER_CONN e lista VUOTA = nessuno può
+	 * connettersi → device non accoppiabile PER SEMPRE. Senza bond → adv APERTO
+	 * (bootstrap pairing); col bond ESP32 → adv filtrato verso quel solo peer. */
+	/* preset connectable+scan. NB: BT_LE_ADV_CONN è deprecato da NCS 2.8 → al
+	 * prossimo bump dell'SDK sostituire con BT_LE_ADV_CONN_FAST_2. */
+	struct bt_le_adv_param param = *BT_LE_ADV_CONN;
+	bool have_bond;
+	int err;
+
+	/* Stop preventivo: bt_le_adv_start NON ri-applica i parametri se l'adv è già
+	 * attivo (ritorna -EALREADY) → per passare aperto↔filtrato bisogna ripartire. */
+	(void)bt_le_adv_stop();
+
+	have_bond = rebuild_accept_list();
+	if (have_bond) {
+		param.options |= BT_LE_ADV_OPT_FILTER_CONN |
+				 BT_LE_ADV_OPT_FILTER_SCAN_REQ;
+	}
+
+	err = bt_le_adv_start(&param, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
 	if (err && err != -EALREADY) {
 		LOG_ERR("adv start failed (%d)", err);
 		return;
 	}
-	LOG_INF("advertising (svc 0xBB00, name '%s')", DEVNAME);
+	LOG_INF("advertising (svc 0xBB00, name '%s') — %s", DEVNAME,
+		have_bond ? "accept-list (solo bond ESP32)" : "aperto (pairing)");
 }
 
 static void on_connected(struct bt_conn *conn, uint8_t err)
 {
+	int rc;
+
 	if (err) {
 		LOG_WRN("connection failed (0x%02x)", err);
 		advertising_start();   /* riprova ad annunciarsi */
 		return;
 	}
-	LOG_INF("central connesso");
+	s_conn_count++;
+	LOG_INF("central connesso → richiedo cifratura (L2)");
+	/* GUARDRAIL #2: L2 (unauthenticated), NON L3+ — Just Works non soddisfa L3+
+	 * → le write 0xBB03/04 verrebbero rifiutate per sempre. */
+	rc = bt_conn_set_security(conn, BT_SECURITY_L2);
+	if (rc) {
+		LOG_WRN("bt_conn_set_security(L2) rc=%d", rc);
+	}
 }
 
 static void on_disconnected(struct bt_conn *conn, uint8_t reason)
 {
 	ARG_UNUSED(conn);
+	if (s_conn_count > 0) {
+		s_conn_count--;
+	}
 	LOG_INF("central disconnesso (0x%02x) → riavvio advertising", reason);
 	s_stream_subscribed = false;
 	advertising_start();
 }
 
+static void on_security_changed(struct bt_conn *conn, bt_security_t level,
+				enum bt_security_err err)
+{
+	ARG_UNUSED(conn);
+	if (err) {
+		LOG_WRN("cifratura FALLITA (level %d, err %d) — scritture 0xBB03/04 "
+			"resteranno rifiutate finché il link non è cifrato", level, err);
+	} else {
+		LOG_INF("link cifrato attivo: security level %d", level);
+	}
+}
+
 BT_CONN_CB_DEFINE(conn_callbacks) = {
 	.connected = on_connected,
 	.disconnected = on_disconnected,
+	.security_changed = on_security_changed,
+};
+
+/* Il bond ora esiste → il prossimo advertising_start (post-disconnect) applicherà
+ * l'accept-list verso il solo ESP32. */
+static void on_pairing_complete(struct bt_conn *conn, bool bonded)
+{
+	ARG_UNUSED(conn);
+	LOG_INF("pairing complete (bonded=%d): enforcement cifratura confine G attivo",
+		bonded);
+}
+
+/* GUARDRAIL #3: su bond cancellato si DEVE tornare ad adv aperto, altrimenti si
+ * resterebbe filtrati verso un bond inesistente → non accoppiabile. Se siamo
+ * connessi ci pensa on_disconnected; se siamo da soli con adv filtrato attivo,
+ * riconciliamo subito (advertising_start fa stop+rebuild → lista vuota → aperto). */
+static void on_bond_deleted(uint8_t id, const bt_addr_le_t *peer)
+{
+	ARG_UNUSED(id); ARG_UNUSED(peer);
+	LOG_INF("bond cancellato → riconcilio advertising (re-pairing)");
+	if (s_conn_count == 0) {
+		advertising_start();
+	}
+}
+
+static struct bt_conn_auth_info_cb auth_info_cb = {
+	.pairing_complete = on_pairing_complete,
+	.bond_deleted = on_bond_deleted,
 };
 
 int wheel_ble_init(void)
@@ -181,10 +282,13 @@ int wheel_ble_init(void)
 		return err;
 	}
 
-	/* Carica i bond persistiti (anti cross-talk: il sensore si bonda all'ESP32). */
+	/* Carica i bond persistiti PRIMA dell'advertising: se il bond ESP32 c'è già,
+	 * si parte subito con l'accept-list (niente finestra aperta superflua). */
 	if (IS_ENABLED(CONFIG_SETTINGS)) {
 		settings_load();
 	}
+
+	(void)bt_conn_auth_info_cb_register(&auth_info_cb);
 
 	advertising_start();
 	return 0;
